@@ -1,6 +1,7 @@
 import NIO
 import Logging
 import MongoCore
+import Foundation
 
 internal struct MongoResponseContext {
     let requestId: Int32
@@ -9,6 +10,8 @@ internal struct MongoResponseContext {
 
 public final class MongoClientContext {
     private var queries = [Int32: MongoResponseContext]()
+    private let queriesQueue = DispatchQueue(label: "org.openkitten.mongokitten.core.queries")
+    
     internal var serverHandshake: ServerHandshake? {
         didSet {
             if let version = serverHandshake?.maxWireVersion, version.isDeprecated {
@@ -20,16 +23,20 @@ public final class MongoClientContext {
     let logger: Logger
 
     internal func handleReply(_ reply: MongoServerReply) -> Bool {
-        guard let query = queries.removeValue(forKey: reply.responseTo) else {
+        let query = queriesQueue.sync {
+            return queries.removeValue(forKey: reply.responseTo)
+        }
+        guard let query else {
             return false
         }
-
         query.result.succeed(reply)
         return true
     }
 
     internal func awaitReply(toRequestId requestId: Int32, completing result: EventLoopPromise<MongoServerReply>) {
-        queries[requestId] = MongoResponseContext(requestId: requestId, result: result)
+        queriesQueue.async { [weak self] in
+            self?.queries[requestId] = MongoResponseContext(requestId: requestId, result: result)
+        }
     }
     
     deinit {
@@ -37,19 +44,24 @@ public final class MongoClientContext {
     }
     
     public func failQuery(byRequestId requestId: Int32, error: Error) {
-        guard let query = queries.removeValue(forKey: requestId) else {
-            return
+        let query = queriesQueue.sync {
+            return queries.removeValue(forKey: requestId)
         }
-        
-        query.result.fail(error)
+        query?.result.fail(error)
     }
 
     public func cancelQueries(_ error: Error) {
-        for query in queries.values {
-            query.result.fail(error)
-        }
+        queriesQueue.sync { [weak self] in
+            guard let self else {
+                return
+            }
+            for query in queries.values {
+                query.result.fail(error)
+            }
 
-        queries = [:]
+            queries = [:]
+        }
+        
     }
 
     public init(logger: Logger) {
